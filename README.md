@@ -9,7 +9,7 @@ EnChat is a lightning-fast, secure, and privacy-focused chat server, client, and
 - **Client-Server Architecture:** Includes both server and client components, enabling easy setup of private chat environments.
 - **Tooling Suite:** Comes bundled with a comprehensive set of tools for managing and customizing the chat server and client.
 - **User-Friendly Interface:** Designed with simplicity and intuitiveness, making it accessible to both novice and experienced users.
-- **Community-Driven Development:** Open-source project with contributions from a vibrant community of developers, ensuring continuous improvement and innovation.
+- **Community-Driven Development:** Open-source project  ensuring continuous improvement and innovation.
 
 ## License
 
