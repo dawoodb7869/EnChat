@@ -2,3 +2,5 @@
 /tools/UsersTool/dist
 /tools/UsersTool/EnChatUserManager.spec
 /tools/UsersTool/build
+/server/.env
+/tools/UsersTool/dist/EnChatUserManager.exe

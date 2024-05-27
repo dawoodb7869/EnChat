@@ -1,16 +1,46 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
+
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+var redisClient *redis.Client
+
+func init() {
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found")
+	}
+
+	// Initialize Redis client
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		log.Fatal("REDIS_URL is not set in .env file")
+	}
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+}
 
 type SystemStats struct {
 	Message     string
@@ -126,8 +156,138 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func authHandler(w http.ResponseWriter, r *http.Request) {
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	// Hash the provided password
+	hashedPassword := hashPassword(password)
+
+	// Authenticate user with hashed password
+	if authenticateUser(username, hashedPassword) {
+		// Generate a token
+		token := generateToken(username)
+
+		// Store token in Redis with a TTL of 1 day
+		if err := setTokenInRedis(token, username); err != nil {
+			http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+			return
+		}
+
+		// Return JSON response with token
+		response := struct {
+			Response string `json:"response"`
+			Token    string `json:"token"`
+		}{
+			Response: "ok",
+			Token:    token,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	} else {
+		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+	}
+}
+
+// Function to hash password using SHA256
+func hashPassword(password string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(password))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+// Function to authenticate user against MongoDB
+func authenticateUser(username, hashedPassword string) bool {
+	// Connect to MongoDB
+	mongoURI := os.Getenv("MONGO_URI")
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	client, err := mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		log.Printf("Failed to connect to MongoDB: %v\n", err)
+		return false
+	}
+	defer client.Disconnect(context.Background())
+
+	// Get user collection
+	collection := client.Database("en_chat").Collection("users")
+
+	// Check if user exists with matching username and hashed password
+	filter := bson.M{"username": username, "password": hashedPassword}
+	var result bson.M
+	err = collection.FindOne(context.Background(), filter).Decode(&result)
+	if err != nil {
+		log.Printf("User authentication failed: %v\n", err)
+		return false
+	}
+
+	// User authenticated successfully
+	return true
+}
+
+func validateTokenHandler(w http.ResponseWriter, r *http.Request) {
+	// Parse token from request query parameter
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Token not provided", http.StatusBadRequest)
+		return
+	}
+
+	// Check if token exists in Redis
+	ctx := context.Background()
+	key := fmt.Sprintf("token:%s", token)
+	_, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Token not found in Redis
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+		http.Error(w, "Failed to validate token", http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate remaining time for token expiration
+	ttl, err := redisClient.TTL(ctx, key).Result()
+	if err != nil {
+		http.Error(w, "Failed to get remaining time for token", http.StatusInternalServerError)
+		return
+	}
+
+	// Return JSON response with validation result and remaining time
+	response := struct {
+		Valid         bool          `json:"valid"`
+		RemainingTime time.Duration `json:"remaining_time"`
+	}{
+		Valid:         true,
+		RemainingTime: ttl,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func generateToken(username string) string {
+	// Generate token based on username and current timestamp
+	currentTime := time.Now().UnixNano()
+	tokenData := fmt.Sprintf("%s%d", username, currentTime)
+	hasher := sha256.New()
+	hasher.Write([]byte(tokenData))
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func setTokenInRedis(token, username string) error {
+	// Set token in Redis with a TTL of 1 day
+	ctx := context.Background()
+	key := fmt.Sprintf("token:%s", token)
+	return redisClient.Set(ctx, key, username, 24*time.Hour).Err()
+}
+
 func main() {
 	http.HandleFunc("/", handler)
+	http.HandleFunc("/auth", authHandler)
+	http.HandleFunc("/validate_token", validateTokenHandler)
+
 	fmt.Println("Server is running at http://localhost:8080/")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Printf("Failed to start server: %v\n", err)
