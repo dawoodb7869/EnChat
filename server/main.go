@@ -42,6 +42,17 @@ func init() {
 	})
 }
 
+type LastSeen struct {
+	Username string      `bson:"username"`
+	LastSeen interface{} `bson:"last_seen"`
+}
+
+type Message struct {
+	Timestamp int64  `bson:"timestamp" json:"timestamp"`
+	Content   string `bson:"content" json:"content"`
+	Username  string `bson:"username" json:"username"`
+}
+
 type SystemStats struct {
 	Message     string
 	OS          string
@@ -51,6 +62,21 @@ type SystemStats struct {
 	TotalMemory float64
 	FreeMemory  float64
 	Uptime      string
+}
+
+func validateToken(token string) (string, error) {
+	// Check if token exists in Redis
+	ctx := context.Background()
+	key := fmt.Sprintf("token:%s", token)
+	username, err := redisClient.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			// Token not found in Redis
+			return "", fmt.Errorf("invalid token")
+		}
+		return "", err
+	}
+	return username, nil
 }
 
 func getSystemStats() (SystemStats, error) {
@@ -118,34 +144,39 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmpl, err := template.New("index").Parse(`
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>System Stats</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 40px; padding: 20px; background-color: #f4f4f4; }
-        h1 { color: #333; }
-        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-        th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
-        th { background-color: #f2f2f2; }
-    </style>
-</head>
-<body>
-    <h1>{{.Message}}</h1>
-    <table>
-        <tr><th>Operating System</th><td>{{.OS}}</td></tr>
-        <tr><th>CPU Model</th><td>{{.CPUModel}}</td></tr>
-        <tr><th>CPU Cores</th><td>{{.CPUCores}}</td></tr>
-        <tr><th>CPU Usage</th><td>{{.CPUUsage}}%</td></tr>
-        <tr><th>Total Memory</th><td>{{.TotalMemory}} GB</td></tr>
-        <tr><th>Free Memory</th><td>{{.FreeMemory}} GB</td></tr>
-        <tr><th>Uptime</th><td>{{.Uptime}}</td></tr>
-    </table>
-</body>
-</html>
-`)
+	<!DOCTYPE html>
+	<html lang="en">
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<title>System Stats</title>
+		<style>
+			body { font-family: Arial, sans-serif; margin: 40px; padding: 20px; background-color: #f4f4f4; }
+			h1 { color: #333; }
+			table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+			th, td { padding: 12px; border: 1px solid #ddd; text-align: left; }
+			th { background-color: #f2f2f2; }
+			footer { margin-top: 40px; font-size: 0.9em; color: #666; }
+		</style>
+	</head>
+	<body>
+		<h1>{{.Message}}</h1>
+		<table>
+			<tr><th>Operating System</th><td>{{.OS}}</td></tr>
+			<tr><th>CPU Model</th><td>{{.CPUModel}}</td></tr>
+			<tr><th>CPU Cores</th><td>{{.CPUCores}}</td></tr>
+			<tr><th>CPU Usage</th><td>{{.CPUUsage}}%</td></tr>
+			<tr><th>Total Memory</th><td>{{.TotalMemory}} GB</td></tr>
+			<tr><th>Free Memory</th><td>{{.FreeMemory}} GB</td></tr>
+			<tr><th>Uptime</th><td>{{.Uptime}}</td></tr>
+		</table>
+		<footer>
+			<p>Version 1.0.0</p>
+			<p>Developed with <span style="color: red;">&hearts;</span> by <a href="https://dawood.tech" target="_blank">Muhammad Dawood</a></p>
+		</footer>
+	</body>
+	</html>
+	`)
 	if err != nil {
 		http.Error(w, "Could not parse template", http.StatusInternalServerError)
 		return
@@ -187,6 +218,109 @@ func authHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 	} else {
 		http.Error(w, "Invalid username or password", http.StatusUnauthorized)
+	}
+}
+
+func fetchMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Token not provided", http.StatusBadRequest)
+		log.Println("Token not provided")
+		return
+	}
+
+	// Validate token and get username
+	username, err := validateToken(token)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		log.Printf("Invalid token: %v", err)
+		return
+	}
+
+	if username == "" {
+		http.Error(w, "Username not found for the provided token", http.StatusUnauthorized)
+		log.Println("Username not found for the provided token")
+		return
+	}
+
+	// Connect to MongoDB
+	mongoURI := os.Getenv("MONGO_URI")
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	client, err := mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		http.Error(w, "Failed to connect to MongoDB", http.StatusInternalServerError)
+		log.Printf("Failed to connect to MongoDB: %v", err)
+		return
+	}
+	defer client.Disconnect(context.Background())
+
+	// Get last_seen collection
+	lastSeenCollection := client.Database("en_chat").Collection("last_seen")
+
+	// Get the last_seen timestamp for the user
+	var lastSeenDoc struct {
+		LastSeen int64 `bson:"last_seen"`
+	}
+	filter := bson.M{"username": username}
+	err = lastSeenCollection.FindOne(context.Background(), filter).Decode(&lastSeenDoc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			http.Error(w, "No last_seen data found for the user", http.StatusNotFound)
+		} else {
+			http.Error(w, "Failed to fetch last_seen data", http.StatusInternalServerError)
+		}
+		log.Printf("Failed to fetch last_seen data for username %s: %v", username, err)
+		return
+	}
+
+	// Get messages collection
+	messagesCollection := client.Database("en_chat").Collection("messages")
+
+	// Query for messages
+	cursor, err := messagesCollection.Find(context.Background(), bson.M{})
+	if err != nil {
+		http.Error(w, "Failed to query messages", http.StatusInternalServerError)
+		log.Printf("Failed to query messages: %v", err)
+		return
+	}
+	defer cursor.Close(context.Background())
+
+	// Separate messages into read and unread
+	var messages []Message
+	var unreadMessages []Message
+	for cursor.Next(context.Background()) {
+		var message Message
+		if err := cursor.Decode(&message); err != nil {
+			http.Error(w, "Failed to decode message data", http.StatusInternalServerError)
+			log.Printf("Failed to decode message data: %v", err)
+			return
+		}
+		if message.Timestamp <= lastSeenDoc.LastSeen {
+			messages = append(messages, message)
+		} else {
+			unreadMessages = append(unreadMessages, message)
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		http.Error(w, "Error iterating through messages", http.StatusInternalServerError)
+		log.Printf("Error iterating through messages: %v", err)
+		return
+	}
+
+	// Return JSON response with messages and unread_messages
+	response := struct {
+		Messages       []Message `json:"messages"`
+		UnreadMessages []Message `json:"unread_messages"`
+	}{
+		Messages:       messages,
+		UnreadMessages: unreadMessages,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		log.Printf("Failed to encode response: %v", err)
 	}
 }
 
@@ -283,10 +417,68 @@ func setTokenInRedis(token, username string) error {
 	return redisClient.Set(ctx, key, username, 24*time.Hour).Err()
 }
 
+func onlineUsersHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		http.Error(w, "Token not provided", http.StatusBadRequest)
+		return
+	}
+
+	// Validate token
+	_, err := validateToken(token)
+	if err != nil {
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	// Connect to MongoDB
+	mongoURI := os.Getenv("MONGO_URI")
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	client, err := mongo.Connect(context.Background(), clientOptions)
+	if err != nil {
+		http.Error(w, "Failed to connect to MongoDB", http.StatusInternalServerError)
+		return
+	}
+	defer client.Disconnect(context.Background())
+
+	// Get last_seen collection
+	collection := client.Database("en_chat").Collection("last_seen")
+
+	// Query for users who have a last_seen status of "online"
+	filter := bson.M{"last_seen": "online"}
+	cursor, err := collection.Find(context.Background(), filter)
+	if err != nil {
+		http.Error(w, "Failed to query online users", http.StatusInternalServerError)
+		return
+	}
+	defer cursor.Close(context.Background())
+
+	// Collect the usernames of online users
+	var onlineUsers []string
+	for cursor.Next(context.Background()) {
+		var user LastSeen
+		if err := cursor.Decode(&user); err != nil {
+			http.Error(w, "Failed to decode user data", http.StatusInternalServerError)
+			return
+		}
+		onlineUsers = append(onlineUsers, user.Username)
+	}
+
+	// Return the list of online users as JSON
+	w.Header().Set("Content-Type", "application/json")
+	if len(onlineUsers) == 0 {
+		json.NewEncoder(w).Encode([]string{})
+	} else {
+		json.NewEncoder(w).Encode(onlineUsers)
+	}
+}
+
 func main() {
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/auth", authHandler)
 	http.HandleFunc("/validate_token", validateTokenHandler)
+	http.HandleFunc("/online_users", onlineUsersHandler)
+	http.HandleFunc("/fetch_messages", fetchMessagesHandler)
 
 	fmt.Println("Server is running at http://localhost:8080/")
 	if err := http.ListenAndServe(":8080", nil); err != nil {
